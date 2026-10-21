@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buff Ledger bridge</title>
+<style>
+  body { margin: 0; padding: 32px 16px; background: #14110c; color: #f3ead8; font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { color: #e8c77a; font-size: 20px; letter-spacing: 2px; }
+  code { color: #e8c77a; }
+  a { color: #e8c77a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BUFF LEDGER BRIDGE</h1>
+  <p>This page is used by the <strong>Buff Ledger</strong> Deadlock mod. The game opens it in a hidden panel
+  to read public statistics from <a href="https://deadlock-api.com">deadlock-api.com</a>: how much hero damage
+  per minute players of your rank deal on your hero. Nothing is sent anywhere else.</p>
+  <p>There is nothing to do here.</p>
+</main>
+<script>
+"use strict";
+// Opened by the game in a hidden HTML panel:
+//   index.html?r=<n>#job=ref&q=<n>&hero=<hero name as the game shows it>&lang=<game language>[&acc=<account id>][&tier=<1-11>]
+// The game's HUD cannot reach the web, so this page asks deadlock-api and hands the
+// answer back through its title, which the HUD reads: "BLR1:<q>:<json>".
+var API = "https://api.deadlock-api.com";
+var HOUR = 3600 * 1000, DAY = 24 * HOUR;
+var PCTS = [1, 5, 10, 25, 50, 75, 90, 95, 99];
+
+function cacheGet(key, maxAge) {
+  try {
+    var e = JSON.parse(localStorage.getItem("bl_" + key) || "null");
+    return e && Date.now() - e.t < maxAge ? e.v : undefined;
+  } catch (x) { return undefined; }
+}
+function cachePut(key, value) {
+  try { localStorage.setItem("bl_" + key, JSON.stringify({ t: Date.now(), v: value })); } catch (x) { }
+}
+
+function getJson(path) {
+  return fetch(API + path).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status + " on " + path.split("?")[0]);
+    return r.json();
+  });
+}
+
+// Names compared without case, accents or punctuation.
+function norm(s) {
+  return String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+// [id, name] of every playable hero, in the game's language (kept 3 days).
+function heroList(lang) {
+  var key = "heroes_" + lang, cached = cacheGet(key, 3 * DAY);
+  if (cached) return Promise.resolve(cached);
+  return getJson("/v1/assets/heroes?only_active=true&language=" + encodeURIComponent(lang)).then(function (list) {
+    var small = (list || []).filter(function (h) { return h && h.id && h.name; }).map(function (h) { return [h.id, h.name]; });
+    cachePut(key, small);
+    return small;
+  });
+}
+
+function findHero(name, lang) {
+  var n = norm(name);
+  function pick(list) { return list.filter(function (h) { return norm(h[1]) === n; })[0]; }
+  return heroList(lang).catch(function () { return []; }).then(function (list) {
+    var hit = pick(list);
+    if (hit || lang === "english") return hit;
+    return heroList("english").then(pick);
+  });
+}
+
+// Rank tier (1 Initiate ... 11 Eternus) of an account, 0 if unknown (kept 12 hours).
+function tierOf(acc) {
+  if (!acc) return Promise.resolve(0);
+  var key = "tier_" + acc, cached = cacheGet(key, 12 * HOUR);
+  if (cached !== undefined) return Promise.resolve(cached);
+  return getJson("/v1/players/rank?account_ids=" + encodeURIComponent(acc)).then(function (list) {
+    var r = (list || []).filter(function (x) { return String(x.account_id) === String(acc); })[0] || (list || [])[0];
+    var tier = r && typeof r.badge === "number" ? Math.floor(r.badge / 10) : 0;
+    cachePut(key, tier);
+    return tier;
+  }, function () { return 0; });
+}
+
+// Hero damage per minute over the last 30 days, on this hero, at this rank (0: every rank). Kept 12 hours.
+function distribution(heroId, tier) {
+  var key = "dist_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  if (cached !== undefined) return Promise.resolve(cached);
+  var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;   // same address for an hour: cached by the API too
+  var path = "/v1/analytics/player-stats/metrics?game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
+    (tier ? "&min_average_badge=" + tier * 10 + "&max_average_badge=" + (tier * 10 + 9) : "");
+  return getJson(path).then(function (m) {
+    var d = m && m.player_damage_per_min;
+    var out = d && d.percentile50 > 0 ? { a: Math.round(d.avg), p: PCTS.map(function (k) { return Math.round(d["percentile" + k]); }) } : null;
+    cachePut(key, out);
+    return out;
+  });
+}
+
+function answer(q, msg) {
+  document.title = "BLR1:" + q + ":" + JSON.stringify(msg);
+}
+
+function run() {
+  var P = new URLSearchParams(location.hash.slice(1));
+  var q = P.get("q") || "0";
+  if (P.get("job") !== "ref") { answer(q, { ok: 0, e: "unknown job" }); return; }
+  var name = P.get("hero") || "", lang = (P.get("lang") || "english").toLowerCase(), wanted = Number(P.get("tier")) || 0;
+  Promise.all([findHero(name, lang), wanted ? Promise.resolve(wanted) : tierOf(P.get("acc"))]).then(function (r) {
+    var hero = r[0], tier = r[1], src = wanted ? "setting" : tier ? "rank" : "all";
+    if (!hero) { answer(q, { ok: 0, e: "hero not found: " + name }); return; }
+    return distribution(hero[0], tier).then(function (d) {
+      if (d || !tier) return d;
+      tier = 0; src = "all";   // not enough matches at that rank: every rank
+      return distribution(hero[0], 0);
+    }).then(function (d) {
+      answer(q, d ? { ok: 1, hero: hero[0], name: name, tier: tier, src: src, d: d } : { ok: 0, e: "no data for hero " + hero[0] });
+    });
+  }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
+}
+
+window.addEventListener("hashchange", run);
+run();
+</script>
+</body>
+</html>
