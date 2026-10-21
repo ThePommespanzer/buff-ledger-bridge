@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Buff Ledger bridge</title>
+<title>Occult Ledger bridge</title>
 <style>
   body { margin: 0; padding: 32px 16px; background: #14110c; color: #f3ead8; font: 15px/1.5 system-ui, sans-serif; }
   main { max-width: 640px; margin: 0 auto; }
@@ -14,8 +14,8 @@
 </head>
 <body>
 <main>
-  <h1>BUFF LEDGER BRIDGE</h1>
-  <p>This page is used by the <strong>Buff Ledger</strong> Deadlock mod. The game opens it in a hidden panel
+  <h1>Occult Ledger bridge</h1>
+  <p>This page is used by the <strong>Occult Ledger</strong> Deadlock mod (formerly Buff Ledger). The game opens it in a hidden panel
   to read public statistics from <a href="https://deadlock-api.com">deadlock-api.com</a>: how much hero damage
   per minute players of your rank deal on your hero, and the rank and stats of the players of your match.
   Nothing is sent anywhere else.</p>
@@ -89,16 +89,26 @@ function tierOf(acc) {
   }, function (e) { return { tier: 0, why: "rank lookup failed (" + String(e && e.message || e) + ")" }; });
 }
 
-// Hero damage per minute over the last 30 days, on this hero, at this rank (0: every rank). Kept 12 hours.
+// On this hero, at this rank (0: every rank), normal games of the last 30 days (kept 12 hours):
+//   a, p: hero damage per minute over whole matches (average, percentiles 1..99)
+//   c:    hero damage dealt so far at given match times: [[seconds, average, std], ...]
+//         (3, 6, 9, 12, 15 min, then every 5 min), to compare at the same point of the match
 function distribution(heroId, tier) {
-  var key = "dist_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  var key = "dist2_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
   if (cached !== undefined) return Promise.resolve(cached);
   var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;   // same address for an hour: cached by the API too
-  var path = "/v1/analytics/player-stats/metrics?game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
+  var filters = "game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
     (tier ? "&min_average_badge=" + tier * 10 + "&max_average_badge=" + (tier * 10 + 9) : "");
-  return getJson(path).then(function (m) {
-    var d = m && m.player_damage_per_min;
-    var out = d && d.percentile50 > 0 ? { a: Math.round(d.avg), p: PCTS.map(function (k) { return Math.round(d["percentile" + k]); }) } : null;
+  var metrics = getJson("/v1/analytics/player-stats/metrics?" + filters);
+  var curve = getJson("/v1/analytics/player-performance-curve?resolution=0&" + filters).catch(function () { return null; });
+  return Promise.all([metrics, curve]).then(function (r) {
+    var d = r[0] && r[0].player_damage_per_min;
+    if (!d || !(d.percentile50 > 0)) { cachePut(key, null); return null; }
+    var out = { a: Math.round(d.avg), p: PCTS.map(function (k) { return Math.round(d["percentile" + k]); }) };
+    var pts = (r[1] || []).filter(function (x) { return x && x.game_time > 0 && x.player_damage_avg > 0 && x.player_damage_std > 0 && (x.samples || 0) >= 30; })
+      .sort(function (x, y) { return x.game_time - y.game_time; })
+      .map(function (x) { return [x.game_time, Math.round(x.player_damage_avg), Math.round(x.player_damage_std)]; });
+    if (pts.length >= 2) out.c = pts;
     cachePut(key, out);
     return out;
   });
