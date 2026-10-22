@@ -429,7 +429,9 @@ function run() {
       tier = 0; src = "all"; why = "few matches at that rank";   // every rank instead
       return distribution(hero[0], 0);
     }).then(function (d) {
-      answer(q, d ? { ok: 1, hero: hero[0], name: name, tier: tier, src: src, why: why || undefined, d: d } : { ok: 0, e: "no data for hero " + hero[0] });
+      // only what the HUD uses (the title that carries the answer stays short)
+      var dd = d ? { a: d.a, p: d.p, c: d.c, n: d.n, np: d.np } : null;
+      answer(q, dd ? { ok: 1, hero: hero[0], name: name, tier: tier, src: src, why: why || undefined, d: dd } : { ok: 0, e: "no data for hero " + hero[0] });
     });
   }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
 }
