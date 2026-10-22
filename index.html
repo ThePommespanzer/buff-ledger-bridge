@@ -26,6 +26,7 @@
 // Opened by the game in a hidden HTML panel:
 //   index.html?r=<n>#job=ref&q=<n>&hero=<hero name as the game shows it>&lang=<game language>[&acc=<account id>][&tier=<1-11>]
 //   index.html?r=<n>#job=players&q=<n>&lang=<game language>&p=<account>~<hero name>,<account>~<hero name>,...
+//   index.html?r=<n>#job=final&q=<n>&acc=<account id>&hero=<hero id>&tier=<0-11>&end=<unix s>[&id=<match id>]
 // The game's HUD cannot reach the web, so this page asks deadlock-api and hands the
 // answer back through its title, which the HUD reads: "BLR1:<q>:<json>".
 var API = "https://api.deadlock-api.com";
@@ -98,8 +99,12 @@ function tierOf(acc) {
 //   c:    that damage dealt so far at given match times: [[seconds, average, std], ...]
 //         (3, 6, 9, 12, 15 min, then every 5 min), to compare at the same point of the match.
 //         The std adds the three spreads assuming they move together halfway (correlation 0.5).
+//   n:    souls (net worth) at given match times: [[seconds, average, std], ...]
+//   np:   souls per minute over whole matches (percentiles 1..99)
+//   pc:   damage to players only at given match times: [[seconds, average, std], ...]
+//         (for the recap, once the exact numbers of the match are known)
 function distribution(heroId, tier) {
-  var key = "dist3_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  var key = "dist4_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
   if (cached !== undefined) return Promise.resolve(cached);
   var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;   // same address for an hour: cached by the API too
   var filters = "game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
@@ -127,6 +132,16 @@ function distribution(heroId, tier) {
         return [x.game_time, Math.round(avg), Math.round(sd)];
       });
     if (pts.length >= 2) out.c = pts;
+    var curve = (r[1] || []).filter(function (x) { return x && x.game_time > 0 && (x.samples || 0) >= 30; })
+      .sort(function (x, y) { return x.game_time - y.game_time; });
+    var nw = curve.filter(function (x) { return x.net_worth_avg > 0 && x.net_worth_std > 0; })
+      .map(function (x) { return [x.game_time, Math.round(x.net_worth_avg), Math.round(x.net_worth_std)]; });
+    if (nw.length >= 2) out.n = nw;
+    var pd = curve.filter(function (x) { return x.player_damage_avg > 0 && x.player_damage_std > 0; })
+      .map(function (x) { return [x.game_time, Math.round(x.player_damage_avg), Math.round(x.player_damage_std)]; });
+    if (pd.length >= 2) out.pc = pd;
+    var sm = m.net_worth_per_min || m.networth_per_min;
+    if (sm && sm.percentile50 > 0) out.np = PCTS.map(function (k) { return Math.round(sm["percentile" + k]); });
     cachePut(key, out);
     return out;
   });
@@ -164,7 +179,8 @@ function statsOf(accs) {
 }
 
 // For every player: [badge, matches on their hero (-1 if the hero is unknown), wins on it,
-// matches, wins, kills, deaths, assists, damage/min, accuracy, headshot rate] (rates in per mille).
+// matches, wins, kills, deaths, assists, damage/min, accuracy, headshot rate (rates in per mille),
+// kills, deaths, assists on their hero (-1 if none)].
 function playersJob(P, q) {
   var lang = (P.get("lang") || "english").toLowerCase();
   var pairs = String(P.get("p") || "").split(",").map(function (x) {
@@ -186,9 +202,87 @@ function playersJob(P, q) {
         if (h[0] === hid) mine = h;
       });
       out[acc] = [r[2][acc] || 0, hid ? (mine ? mine[1] : 0) : -1, mine ? mine[2] : 0, m, w, k, d, a,
-        m ? Math.round(dpm / m) : 0, m ? Math.round(1000 * ac / m) : 0, m ? Math.round(1000 * hs / m) : 0];
+        m ? Math.round(dpm / m) : 0, m ? Math.round(1000 * ac / m) : 0, m ? Math.round(1000 * hs / m) : 0,
+        mine ? mine[3] : -1, mine ? mine[4] : -1, mine ? mine[5] : -1];
     });
     answer(q, { ok: 1, d: out });
+  }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
+}
+
+// ---- after the match: its exact numbers, from the match file deadlock-api keeps
+//
+// The match is the one given by id or, without it, the latest match of this account on
+// this hero that ended around `end`. Its file gives, for this player at the end: damage to
+// players, neutral camps, bosses and objectives, troopers, souls, K/D/A, and who won.
+// Then the standing against players of the same rank on the same hero at that match time:
+// damage to players only (the game's own "player damage") and souls, averaged.
+function teamNum(t) { var d = String(t === undefined || t === null ? "" : t).replace(/\D/g, ""); return d === "" ? -1 : Number(d.slice(-1)); }
+function expectedAt(c, secs) {
+  var prev = [0, 0, 0];
+  for (var i = 0; i < c.length; i++) {
+    if (secs <= c[i][0]) {
+      var f = (secs - prev[0]) / Math.max(1, c[i][0] - prev[0]);
+      return [prev[1] + f * (c[i][1] - prev[1]), prev[2] + f * (c[i][2] - prev[2])];
+    }
+    prev = c[i];
+  }
+  var k = secs / Math.max(1, prev[0]);
+  return [prev[1] * k, prev[2] * k];
+}
+function normalCdf(z) {
+  var t = 1 / (1 + 0.2316419 * Math.abs(z)), d = 0.3989423 * Math.exp(-z * z / 2);
+  var q = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - q : q;
+}
+function pctOn(curve, v, secs) {
+  if (!curve || curve.length < 2 || !(secs > 0)) return null;
+  var e = expectedAt(curve, secs);
+  return Math.max(0.5, Math.min(99.5, 100 * normalCdf((v - e[0]) / Math.max(1, e[1]))));
+}
+function findMatch(acc, heroId, end) {
+  return getJson("/v1/players/" + acc + "/match-history").then(function (list) {
+    var best = null;
+    (list || []).forEach(function (m) {
+      if (!m || !m.match_id || (heroId && m.hero_id && Number(m.hero_id) !== heroId)) return;
+      var ends = Number(m.start_time || 0) + Number(m.match_duration_s || 0);
+      if (end && Math.abs(ends - end) > 3600) return;
+      if (!best || Number(m.start_time || 0) > Number(best.start_time || 0)) best = m;
+    });
+    if (!best) throw new Error("match not in history yet");
+    return String(best.match_id);
+  });
+}
+function finalJob(P, q) {
+  var acc = String(P.get("acc") || ""), heroId = Number(P.get("hero")) || 0, tier = Number(P.get("tier")) || 0;
+  var end = Number(P.get("end")) || 0, id = String(P.get("id") || "");
+  if (!/^\d{1,10}$/.test(acc)) { answer(q, { ok: 0, e: "no account" }); return; }
+  var key = "final_" + acc + "_" + (id || end), cached = cacheGet(key, 7 * DAY);
+  if (cached) { answer(q, cached); return; }
+  (/^\d{4,}$/.test(id) ? Promise.resolve(id) : findMatch(acc, heroId, end)).then(function (mid) {
+    return getJson("/v1/matches/" + mid + "/metadata").then(function (md) {
+      var info = md && (md.match_info || md);
+      var players = (info && info.players) || [];
+      var me = players.filter(function (x) { return String(x.account_id) === acc; })[0];
+      if (!me) throw new Error("player not in match " + mid);
+      var st = (me.stats || []).slice().sort(function (a, b) { return (a.time_stamp_s || 0) - (b.time_stamp_s || 0); });
+      var last = st[st.length - 1] || {};
+      var dur = Number(info.duration_s || last.time_stamp_s || 0);
+      var hid = Number(me.hero_id) || heroId;
+      var out = { ok: 1, id: mid, dur: dur, won: teamNum(info.winning_team) === teamNum(me.team) ? 1 : 0,
+        pd: last.player_damage || 0, nd: last.neutral_damage || 0, bd: last.boss_damage || 0, cd: last.creep_damage || 0,
+        nw: Number(me.net_worth || last.net_worth || 0), k: Number(me.kills || 0), d: Number(me.deaths || 0), a: Number(me.assists || 0) };
+      return distribution(hid, tier).then(function (dist) {
+        if (!dist && tier) return distribution(hid, 0);
+        return dist;
+      }).then(function (dist) {
+        var pp = dist ? pctOn(dist.pc, out.pd, dur) : null, sp = dist ? pctOn(dist.n, out.nw, dur) : null;
+        out.pdPct = pp === null ? null : Math.round(pp);
+        out.nwPct = sp === null ? null : Math.round(sp);
+        out.pct = pp !== null && sp !== null ? Math.round((pp + sp) / 2) : out.pdPct !== null ? out.pdPct : out.nwPct;
+        cachePut(key, out);
+        answer(q, out);
+      });
+    });
   }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
 }
 
@@ -200,6 +294,7 @@ function run() {
   var P = new URLSearchParams(location.hash.slice(1));
   var q = P.get("q") || "0";
   if (P.get("job") === "players") { playersJob(P, q); return; }
+  if (P.get("job") === "final") { finalJob(P, q); return; }
   if (P.get("job") !== "ref") { answer(q, { ok: 0, e: "unknown job" }); return; }
   var name = P.get("hero") || "", lang = (P.get("lang") || "english").toLowerCase(), wanted = Number(P.get("tier")) || 0;
   Promise.all([findHero(name, lang), wanted ? Promise.resolve({ tier: wanted, why: "" }) : tierOf(P.get("acc"))]).then(function (r) {
