@@ -276,6 +276,46 @@ function pctOn(curve, v, secs) {
   var e = expectedAt(curve, secs);
   return Math.max(0.5, Math.min(99.5, 100 * normalCdf((v - e[0]) / Math.max(1, e[1]))));
 }
+// ---- key items: your first tier 3 and 4 purchases of the match, against when players of
+// your rank on your hero buy the same items on average (deadlock-api item stats)
+function itemNames(lang) {
+  var key = "items_" + lang, cached = cacheGet(key, 3 * DAY);
+  if (cached) return Promise.resolve(cached);
+  return getJson("/v1/assets/items/by-type/upgrade?language=" + encodeURIComponent(lang)).then(function (list) {
+    var out = {};
+    (list || []).forEach(function (it) { if (it && it.id && it.name) out[it.id] = [it.name, +it.item_tier || 0]; });
+    cachePut(key, out);
+    return out;
+  });
+}
+function itemTimes(heroId, tier) {
+  var key = "itemtimes_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  if (cached) return Promise.resolve(cached);
+  var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;
+  return getJson("/v1/analytics/item-stats?game_mode=normal&hero_id=" + heroId + "&min_unix_timestamp=" + since + "&min_matches=30" +
+    (tier ? "&min_average_badge=" + tier * 10 + "&max_average_badge=" + (tier * 10 + 9) : "")).then(function (list) {
+    var out = {};
+    (list || []).forEach(function (r) { if (r && r.item_id && r.avg_buy_time_s > 0) out[r.item_id] = Math.round(r.avg_buy_time_s); });
+    cachePut(key, out);
+    return out;
+  });
+}
+function keyItems(me, heroId, tier, lang) {
+  var bought = {};
+  (me.items || []).forEach(function (it) {
+    var t = +it.game_time_s || 0, id = +it.item_id || 0;
+    if (id && t > 0 && (!bought[id] || t < bought[id])) bought[id] = t;
+  });
+  if (!Object.keys(bought).length) return Promise.resolve(null);
+  return Promise.all([itemNames(lang).catch(function () { return itemNames("english"); }).catch(function () { return {}; }),
+    itemTimes(heroId, tier).catch(function () { return {}; })]).then(function (r) {
+    var names = r[0], avg = r[1];
+    return Object.keys(bought).map(Number).filter(function (id) { return names[id] && names[id][1] >= 3; })
+      .sort(function (a, b) { return bought[a] - bought[b]; }).slice(0, 5)
+      .map(function (id) { return [names[id][0], bought[id], avg[id] || 0]; });
+  });
+}
+
 function findMatch(acc, heroId, end) {
   return getJson("/v1/players/" + acc + "/match-history").then(function (list) {
     var best = null;
@@ -291,9 +331,9 @@ function findMatch(acc, heroId, end) {
 }
 function finalJob(P, q) {
   var acc = String(P.get("acc") || ""), heroId = Number(P.get("hero")) || 0, tier = Number(P.get("tier")) || 0;
-  var end = Number(P.get("end")) || 0, id = String(P.get("id") || "");
+  var end = Number(P.get("end")) || 0, id = String(P.get("id") || ""), lang = (P.get("lang") || "english").toLowerCase();
   if (!/^\d{1,10}$/.test(acc)) { answer(q, { ok: 0, e: "no account" }); return; }
-  var key = "final_" + acc + "_" + (id || end), cached = cacheGet(key, 7 * DAY);
+  var key = "final2_" + acc + "_" + (id || end), cached = cacheGet(key, 7 * DAY);
   if (cached) { answer(q, cached); return; }
   (/^\d{4,}$/.test(id) ? Promise.resolve(id) : findMatch(acc, heroId, end)).then(function (mid) {
     return getJson("/v1/matches/" + mid + "/metadata").then(function (md) {
@@ -319,6 +359,9 @@ function finalJob(P, q) {
         out.pct = pp !== null && sp !== null ? Math.round((pp + sp) / 2) : out.pdPct !== null ? out.pdPct : out.nwPct;
         // the average player's souls by source at the same match time
         if (dist && dist.g) out.goldAvg = GOLD_GROUPS.map(function (g, j) { return Math.round(curveAt(dist.g, j + 1, dur)); });
+        return keyItems(me, hid, tier, lang).catch(function () { return null; });
+      }).then(function (items) {
+        if (items && items.length) out.items = items;
         cachePut(key, out);
         answer(q, out);
       });
