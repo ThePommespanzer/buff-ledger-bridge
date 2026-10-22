@@ -409,7 +409,9 @@ function laneJob(P, q) {
   }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
 }
 
+var BRIDGE_VERSION = 3;   // raised whenever the HUD needs something new from this page
 function answer(q, msg) {
+  msg.v = BRIDGE_VERSION;
   document.title = "BLR1:" + q + ":" + JSON.stringify(msg);
 }
 
