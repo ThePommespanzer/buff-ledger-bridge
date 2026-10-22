@@ -27,6 +27,7 @@
 //   index.html?r=<n>#job=ref&q=<n>&hero=<hero name as the game shows it>&lang=<game language>[&acc=<account id>][&tier=<1-11>]
 //   index.html?r=<n>#job=players&q=<n>&lang=<game language>&p=<account>~<hero name>,<account>~<hero name>,...
 //   index.html?r=<n>#job=final&q=<n>&acc=<account id>&hero=<hero id>&tier=<0-11>&end=<unix s>[&id=<match id>]
+//   index.html?r=<n>#job=lane&q=<n>&lang=<game language>&tier=<0-11>&mine=<hero name>,<hero name>&enemy=<hero name>,<hero name>
 // The game's HUD cannot reach the web, so this page asks deadlock-api and hands the
 // answer back through its title, which the HUD reads: "BLR1:<q>:<json>".
 var API = "https://api.deadlock-api.com";
@@ -104,7 +105,7 @@ function tierOf(acc) {
 //   pc:   damage to players only at given match times: [[seconds, average, std], ...]
 //         (for the recap, once the exact numbers of the match are known)
 function distribution(heroId, tier) {
-  var key = "dist4_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  var key = "dist5_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
   if (cached !== undefined) return Promise.resolve(cached);
   var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;   // same address for an hour: cached by the API too
   var filters = "game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
@@ -140,11 +141,47 @@ function distribution(heroId, tier) {
     var pd = curve.filter(function (x) { return x.player_damage_avg > 0 && x.player_damage_std > 0; })
       .map(function (x) { return [x.game_time, Math.round(x.player_damage_avg), Math.round(x.player_damage_std)]; });
     if (pd.length >= 2) out.pc = pd;
+    var gp = curve.map(function (x) { return [x.game_time].concat(goldOfCurvePoint(x).map(Math.round)); })
+      .filter(function (x) { return x.slice(1).some(function (v) { return v > 0; }); });
+    if (gp.length >= 2) out.g = gp;
     var sm = m.net_worth_per_min || m.networth_per_min;
     if (sm && sm.percentile50 > 0) out.np = PCTS.map(function (k) { return Math.round(sm["percentile" + k]); });
     cachePut(key, out);
     return out;
   });
+}
+
+// ---- where souls come from, in 6 groups (the order of the recap)
+//   players (kills, assists, assassinations), troopers, camps, bosses and objectives,
+//   loot (Sinners, chests, breakables, golden egg), team bonus
+var GOLD_GROUPS = ["players", "troopers", "camps", "bosses", "loot", "team"];
+// Value of column `col` of a [[seconds, ...values], ...] curve at `secs`: linear between points,
+// from 0 at 0:00, and stretched in proportion past the last point.
+function curveAt(c, col, secs) {
+  var prev = [0], pv = 0;
+  for (var i = 0; i < c.length; i++) {
+    if (secs <= c[i][0]) { var f = (secs - prev[0]) / Math.max(1, c[i][0] - prev[0]); return pv + f * (c[i][col] - pv); }
+    prev = c[i]; pv = c[i][col];
+  }
+  return pv * secs / Math.max(1, prev[0]);
+}
+function goldOfCurvePoint(x) {
+  var g = function (k) { return +x["gold_" + k + "_avg"] || 0; };
+  return [g("player") + g("player_orbs") + g("assists") + g("ability_assassinate") + g("item_trophy_collector"),
+    g("lane_creep") + g("lane_creep_orbs"), g("neutral_creep") + g("neutral_creep_orbs"), g("boss") + g("boss_orb"),
+    g("treasure") + g("item_cultist_sacrifice") + g("breakable") + g("item_goose_egg"), g("team_bonus")];
+}
+function goldOfStats(st) {
+  var src = function (name, num) {
+    return (st.gold_sources || []).reduce(function (s2, x) {
+      var k = String(x.source), hit = k === String(num) || k.toLowerCase().indexOf(name) >= 0;
+      return s2 + (hit ? (+x.gold || 0) + (+x.gold_orbs || 0) : 0);
+    }, 0);
+  };
+  var v = function (k) { return +st[k] || 0; };
+  return [v("gold_player") + v("gold_player_orbs") + src("assists", 6) + src("assassinate", 9) + src("trophy", 10),
+    v("gold_lane_creep") + v("gold_lane_creep_orbs"), v("gold_neutral_creep") + v("gold_neutral_creep_orbs"),
+    v("gold_boss") + v("gold_boss_orb"), v("gold_treasure") + src("cultist", 11) + src("breakable", 12) + src("gooseegg", 13), src("teambonus", 8)];
 }
 
 // Rank badges (tier * 10 + subrank, 0 unranked) of several accounts, kept 12 hours.
@@ -270,7 +307,8 @@ function finalJob(P, q) {
       var hid = Number(me.hero_id) || heroId;
       var out = { ok: 1, id: mid, dur: dur, won: teamNum(info.winning_team) === teamNum(me.team) ? 1 : 0,
         pd: last.player_damage || 0, nd: last.neutral_damage || 0, bd: last.boss_damage || 0, cd: last.creep_damage || 0,
-        nw: Number(me.net_worth || last.net_worth || 0), k: Number(me.kills || 0), d: Number(me.deaths || 0), a: Number(me.assists || 0) };
+        nw: Number(me.net_worth || last.net_worth || 0), k: Number(me.kills || 0), d: Number(me.deaths || 0), a: Number(me.assists || 0),
+        gold: goldOfStats(last).map(Math.round) };
       return distribution(hid, tier).then(function (dist) {
         if (!dist && tier) return distribution(hid, 0);
         return dist;
@@ -279,10 +317,52 @@ function finalJob(P, q) {
         out.pdPct = pp === null ? null : Math.round(pp);
         out.nwPct = sp === null ? null : Math.round(sp);
         out.pct = pp !== null && sp !== null ? Math.round((pp + sp) / 2) : out.pdPct !== null ? out.pdPct : out.nwPct;
+        // the average player's souls by source at the same match time
+        if (dist && dist.g) out.goldAvg = GOLD_GROUPS.map(function (g, j) { return Math.round(curveAt(dist.g, j + 1, dur)); });
         cachePut(key, out);
         answer(q, out);
       });
     });
+  }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
+}
+
+// ---- the lane: how far ahead the duo of these two heroes usually is over the duo of those two,
+// at 3, 6, 9, 12 and 15 minutes (deadlock-api's lane soul curve). Exactly this matchup when it
+// has enough games behind it, else this duo against anyone, else every duo (an even lane).
+function laneJob(P, q) {
+  var lang = (P.get("lang") || "english").toLowerCase(), tier = Number(P.get("tier")) || 0;
+  var mine = String(P.get("mine") || "").split(","), enemy = String(P.get("enemy") || "").split(",");
+  if (mine.length !== 2 || enemy.length !== 2) { answer(q, { ok: 0, e: "need two heroes a side" }); return; }
+  Promise.all([heroList(lang).catch(function () { return []; }), heroList("english").catch(function () { return []; })]).then(function (r) {
+    var names = {};
+    r[1].concat(r[0]).forEach(function (h) { names[norm(h[1])] = h[0]; });
+    var ids = function (l) { return l.map(function (n) { return names[norm(n)] || 0; }).sort(function (a, b) { return a - b; }); };
+    var a = ids(mine), b = ids(enemy);
+    if (!a[0] || !b[0]) { answer(q, { ok: 0, e: "hero not found" }); return; }
+    var key = "lane1_" + a.join("-") + "_" + b.join("-") + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+    if (cached) { answer(q, cached); return; }
+    var base = "/v1/analytics/lane-soul-curve?game_mode=normal&max_time_s=900" +
+      (tier ? "&min_average_badge=" + tier * 10 + "&max_average_badge=" + (tier * 10 + 9) : "");
+    var tries = [["exact", base + "&hero_ids=" + a.join(",") + "&enemy_hero_ids=" + b.join(",") + "&group_by=hero_ids,enemy_hero_ids"],
+      ["duo", base + "&hero_ids=" + a.join(",") + "&group_by=hero_ids"], ["all", base + "&group_by=assigned_lane"]];
+    var step = function (i) {
+      if (i >= tries.length) { answer(q, { ok: 0, e: "no lane data" }); return; }
+      getJson(tries[i][1]).then(function (rows) {
+        rows = (rows || []).filter(function (x) { return x && x.sample_times_s && x.sample_times_s.length >= 2; });
+        var n = rows.reduce(function (s2, x) { return s2 + (+x.matches_played || 0); }, 0);
+        if (!rows.length || n < 25) { step(i + 1); return; }
+        // several rows (lanes): weighted by their games
+        var t = rows[0].sample_times_s, d = t.map(function () { return 0; }), v = t.map(function () { return 0; });
+        rows.forEach(function (x) {
+          var w = (+x.matches_played || 0) / n;
+          t.forEach(function (_, j) { d[j] += w * (+x.net_worth_diff[j] || 0); v[j] += w * Math.pow(+x.net_worth_diff_std[j] || 0, 2); });
+        });
+        var out = { ok: 1, scope: tries[i][0], n: n, t: t, d: d.map(Math.round), s: v.map(function (x) { return Math.round(Math.sqrt(x)); }) };
+        cachePut(key, out);
+        answer(q, out);
+      }).catch(function () { step(i + 1); });
+    };
+    step(0);
   }).catch(function (e) { answer(q, { ok: 0, e: String(e && e.message || e) }); });
 }
 
@@ -295,6 +375,7 @@ function run() {
   var q = P.get("q") || "0";
   if (P.get("job") === "players") { playersJob(P, q); return; }
   if (P.get("job") === "final") { finalJob(P, q); return; }
+  if (P.get("job") === "lane") { laneJob(P, q); return; }
   if (P.get("job") !== "ref") { answer(q, { ok: 0, e: "unknown job" }); return; }
   var name = P.get("hero") || "", lang = (P.get("lang") || "english").toLowerCase(), wanted = Number(P.get("tier")) || 0;
   Promise.all([findHero(name, lang), wanted ? Promise.resolve({ tier: wanted, why: "" }) : tierOf(P.get("acc"))]).then(function (r) {
