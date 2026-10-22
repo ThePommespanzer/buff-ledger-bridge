@@ -89,12 +89,17 @@ function tierOf(acc) {
   }, function (e) { return { tier: 0, why: "rank lookup failed (" + String(e && e.message || e) + ")" }; });
 }
 
-// On this hero, at this rank (0: every rank), normal games of the last 30 days (kept 12 hours):
-//   a, p: hero damage per minute over whole matches (average, percentiles 1..99)
-//   c:    hero damage dealt so far at given match times: [[seconds, average, std], ...]
-//         (3, 6, 9, 12, 15 min, then every 5 min), to compare at the same point of the match
+// On this hero, at this rank (0: every rank), normal games of the last 30 days (kept 12 hours).
+// The HUD can only tell troopers apart from every other target (its damage numbers carry no
+// other tag), so what it counts is damage to players + neutral camps + bosses and objectives.
+// The reference is built the same way, from the API's player, neutral and boss damage:
+//   a, p: that damage per minute over whole matches (average, percentiles 1..99; the
+//         percentiles are added up metric by metric, which slightly widens the top)
+//   c:    that damage dealt so far at given match times: [[seconds, average, std], ...]
+//         (3, 6, 9, 12, 15 min, then every 5 min), to compare at the same point of the match.
+//         The std adds the three spreads assuming they move together halfway (correlation 0.5).
 function distribution(heroId, tier) {
-  var key = "dist2_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
+  var key = "dist3_" + heroId + "_" + tier, cached = cacheGet(key, 12 * HOUR);
   if (cached !== undefined) return Promise.resolve(cached);
   var since = Math.floor((Date.now() - 30 * DAY) / HOUR) * 3600;   // same address for an hour: cached by the API too
   var filters = "game_mode=normal&hero_ids=" + heroId + "&min_unix_timestamp=" + since +
@@ -102,12 +107,25 @@ function distribution(heroId, tier) {
   var metrics = getJson("/v1/analytics/player-stats/metrics?" + filters);
   var curve = getJson("/v1/analytics/player-performance-curve?resolution=0&" + filters).catch(function () { return null; });
   return Promise.all([metrics, curve]).then(function (r) {
-    var d = r[0] && r[0].player_damage_per_min;
+    var m = r[0] || {}, d = m.player_damage_per_min;
     if (!d || !(d.percentile50 > 0)) { cachePut(key, null); return null; }
-    var out = { a: Math.round(d.avg), p: PCTS.map(function (k) { return Math.round(d["percentile" + k]); }) };
+    var parts = [d, m.neutral_damage_per_min, m.boss_damage_per_min].filter(function (x) { return x && x.percentile50 >= 0; });
+    var sum = function (f) { return parts.reduce(function (s, x) { return s + (+f(x) || 0); }, 0); };
+    var out = { a: Math.round(sum(function (x) { return x.avg; })),
+      p: PCTS.map(function (k) { return Math.round(sum(function (x) { return x["percentile" + k]; })); }) };
+    var spread = function (sds) {
+      var v = 0, i, j;
+      for (i = 0; i < sds.length; i++) v += sds[i] * sds[i];
+      for (i = 0; i < sds.length; i++) for (j = i + 1; j < sds.length; j++) v += 2 * 0.5 * sds[i] * sds[j];
+      return Math.sqrt(v);
+    };
     var pts = (r[1] || []).filter(function (x) { return x && x.game_time > 0 && x.player_damage_avg > 0 && x.player_damage_std > 0 && (x.samples || 0) >= 30; })
       .sort(function (x, y) { return x.game_time - y.game_time; })
-      .map(function (x) { return [x.game_time, Math.round(x.player_damage_avg), Math.round(x.player_damage_std)]; });
+      .map(function (x) {
+        var avg = x.player_damage_avg + (x.neutral_damage_avg || 0) + (x.boss_damage_avg || 0);
+        var sd = spread([x.player_damage_std, x.neutral_damage_std || 0, x.boss_damage_std || 0]);
+        return [x.game_time, Math.round(avg), Math.round(sd)];
+      });
     if (pts.length >= 2) out.c = pts;
     cachePut(key, out);
     return out;
