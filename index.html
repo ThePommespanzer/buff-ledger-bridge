@@ -184,10 +184,11 @@ function goldOfStats(st) {
     v("gold_boss") + v("gold_boss_orb"), v("gold_treasure") + src("cultist", 11) + src("breakable", 12) + src("gooseegg", 13), src("teambonus", 8)];
 }
 
-// Rank badges (tier * 10 + subrank, 0 unranked) of several accounts, kept 12 hours.
+// Rank badges (tier * 10 + subrank, 0 unranked) of several accounts, kept 30 minutes (a match
+// played in between can change them).
 function badgesOf(accs) {
   var out = {}, missing = [];
-  accs.forEach(function (a) { var c = cacheGet("badge_" + a, 12 * HOUR); if (c !== undefined) out[a] = c; else missing.push(a); });
+  accs.forEach(function (a) { var c = cacheGet("badge_" + a, HOUR / 2); if (c !== undefined) out[a] = c; else missing.push(a); });
   if (!missing.length) return Promise.resolve(out);
   return getJson("/v1/players/rank?account_ids=" + missing.join(",")).then(function (list) {
     missing.forEach(function (a) { out[a] = 0; });
@@ -196,11 +197,12 @@ function badgesOf(accs) {
   }, function () { missing.forEach(function (a) { out[a] = 0; }); return out; });
 }
 
-// Per-hero stats of several accounts (normal games), kept 6 hours:
+// Per-hero stats of several accounts (normal games), kept 30 minutes (so a match just played
+// counts as soon as deadlock-api has it):
 // account -> [[hero_id, matches, wins, kills, deaths, assists, damage/min, accuracy, headshot rate], ...]
 function statsOf(accs) {
   var out = {}, missing = [];
-  accs.forEach(function (a) { var c = cacheGet("stats_" + a, 6 * HOUR); if (c !== undefined) out[a] = c; else missing.push(a); });
+  accs.forEach(function (a) { var c = cacheGet("stats_" + a, HOUR / 2); if (c !== undefined) out[a] = c; else missing.push(a); });
   if (!missing.length) return Promise.resolve(out);
   return getJson("/v1/players/hero-stats?game_mode=normal&account_ids=" + missing.join(",")).then(function (list) {
     missing.forEach(function (a) { out[a] = []; });
